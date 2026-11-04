@@ -1,0 +1,85 @@
+From: lyrids <ly7110@gmail.com>
+Subject: [PATCH] netfilter: flowtable: invalidate cached flows on MTU changes
+
+Flowtable entries cache their forwarding MTU. The netdevice notifier only
+handles NETDEV_DOWN, so lowering a device MTU can leave an established flow
+using its previous limit. A routed bridge or VLAN device may also differ
+from the physical ingress and egress devices stored in the flow.
+
+Handle NETDEV_CHANGEMTU and include output devices and upper/lower device
+relationships when selecting affected entries. Retire both directions
+through the existing teardown and garbage-collection path so subsequent
+packets return to normal forwarding and new entries use the changed MTU.
+
+This changes neither the route PMTU calculation nor per-packet flow lookup.
+It does not add a dependency on a platform offload driver.
+
+Signed-off-by: lyrids <ly7110@gmail.com>
+
+---
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -767,20 +767,49 @@
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_table_init);
+ 
++static bool nf_flow_table_uses_dev(struct net_device *dev, int ifindex)
++{
++	struct net_device *flow_dev;
++
++	if (ifindex == dev->ifindex)
++		return true;
++
++	flow_dev = dev_get_by_index_rcu(dev_net(dev), ifindex);
++	return flow_dev &&
++	       (netdev_has_upper_dev_all_rcu(flow_dev, dev) ||
++		netdev_has_upper_dev_all_rcu(dev, flow_dev));
++}
++
+ static void nf_flow_table_do_cleanup(struct nf_flowtable *flow_table,
+ 				     struct flow_offload *flow, void *data)
+ {
+ 	struct net_device *dev = data;
++	int dir;
+ 
+ 	if (!dev) {
+ 		flow_offload_teardown(flow);
+ 		return;
+ 	}
+ 
+-	if (net_eq(nf_ct_net(flow->ct), dev_net(dev)) &&
+-	    (flow->tuplehash[0].tuple.iifidx == dev->ifindex ||
+-	     flow->tuplehash[1].tuple.iifidx == dev->ifindex))
+-		flow_offload_teardown(flow);
++	if (!net_eq(nf_ct_net(flow->ct), dev_net(dev)))
++		return;
++
++	rcu_read_lock();
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
++
++		if (nf_flow_table_uses_dev(dev, tuple->iifidx) ||
++		    (flow->type == NF_FLOW_OFFLOAD_ROUTE &&
++		     ((tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
++		       (nf_flow_table_uses_dev(dev, tuple->out.ifidx) ||
++			nf_flow_table_uses_dev(dev, tuple->out.hw_ifidx))) ||
++		      (tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT &&
++		       nf_flow_table_uses_dev(dev, tuple->ifidx))))) {
++			flow_offload_teardown(flow);
++			break;
++		}
++	}
++	rcu_read_unlock();
+ }
+ 
+ void nf_flow_table_gc_cleanup(struct nf_flowtable *flowtable,
+@@ -868,7 +897,7 @@
+ {
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+-	if (event != NETDEV_DOWN)
++	if (event != NETDEV_DOWN && event != NETDEV_CHANGEMTU)
+ 		return NOTIFY_DONE;
+ 
+ 	nf_flow_table_cleanup(dev);
