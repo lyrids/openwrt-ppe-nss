@@ -1,0 +1,288 @@
+From: lyrids <ly7110@gmail.com>
+Subject: [PATCH] selftests: netfilter: cover flowtable MTU changes
+
+Exercise an established UDP flow while reducing a routed output MTU from
+1500 to 1492, 1400 and 1280, then restore the original MTU. Cover native,
+VLAN and bridge interfaces, IPv4 and IPv6, and both traffic directions.
+
+Verify OFFLOAD state before each change. Count received request sequence
+numbers rather than echo replies, since a changed ingress MTU can discard
+the reply even when the oversized request incorrectly reached its receiver.
+Check delivery at the new MTU and after restoration as well.
+
+The test requires root, iproute2, nftables, Python 3 and conntrack procfs.
+Its namespaces and temporary files are removed at the end. Where present,
+receive queues use all online CPUs to reduce single-CPU scheduling bias.
+
+Signed-off-by: lyrids <ly7110@gmail.com>
+
+---
+
+--- a/tools/testing/selftests/net/netfilter/Makefile
++++ b/tools/testing/selftests/net/netfilter/Makefile
+@@ -27,6 +27,7 @@
+ 	nft_conntrack_helper.sh \
+ 	nft_fib.sh \
+ 	nft_flowtable.sh \
++	nft_flowtable_mtu.py \
+ 	nft_interface_stress.sh \
+ 	nft_meta.sh \
+ 	nft_nat.sh \
+diff --git a/tools/testing/selftests/net/netfilter/nft_flowtable_mtu.py b/tools/testing/selftests/net/netfilter/nft_flowtable_mtu.py
+new file mode 100755
+--- /dev/null
++++ b/tools/testing/selftests/net/netfilter/nft_flowtable_mtu.py
+@@ -0,0 +1,253 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""Check live flowtable MTU changes on native, VLAN and bridge devices."""
++import json
++import os
++from pathlib import Path
++import select
++import socket
++import struct
++import subprocess
++import sys
++import tempfile
++import time
++
++def echo_server(family, address, port, logfile):
++    sock = socket.socket(family, socket.SOCK_DGRAM)
++    sock.bind((address, port))
++    with open(logfile, "a", buffering=1) as out:
++        out.write(json.dumps({"ready": True}) + "\n")
++        while True:
++            data, peer = sock.recvfrom(65535)
++            if len(data) >= 4:
++                out.write(json.dumps({"seq": struct.unpack("!I", data[:4])[0],
++                                     "bytes": len(data)}) + "\n")
++            sock.sendto(data, peer)
++
++def client(family, local, remote):
++    sock = socket.socket(family, socket.SOCK_DGRAM)
++    sock.bind((local, 41001))
++    # PROBE ignores learned PMTU while keeping DF set for IPv4.
++    sock.setsockopt(socket.IPPROTO_IP if family == socket.AF_INET
++                    else socket.IPPROTO_IPV6,
++                    10 if family == socket.AF_INET else 23, 3)
++    sequence = 0
++    for line in sys.stdin:
++        request = json.loads(line)
++        sent = []
++        errors = []
++        replies = 0
++        for _ in range(request["count"]):
++            sequence += 1
++            data = struct.pack("!I", sequence) + bytes(request["length"] - 4)
++            try:
++                sock.sendto(data, (remote, 42001))
++                sent.append(sequence)
++            except OSError as error:
++                errors.append(str(error))
++                continue
++            deadline = time.monotonic() + 0.2
++            while time.monotonic() < deadline:
++                if not select.select([sock], [], [], max(0, deadline - time.monotonic()))[0]:
++                    break
++                packet = sock.recv(65535)
++                if packet == data:
++                    replies += 1
++                    break
++        print(json.dumps({"sent": sent, "replies": replies, "errors": errors}),
++              flush=True)
++
++def run(argv, **kwargs):
++    return subprocess.run(argv, check=True, capture_output=True, text=True,
++                          timeout=15, **kwargs).stdout
++
++def ns(name, argv, **kwargs):
++    return run(["ip", "netns", "exec", name, *argv], **kwargs)
++
++def write_sysctl(name, key, value):
++    ns(name, ["sh", "-c", "printf '%s' " + str(value) + " > /proc/sys/" + key])
++
++def set_rps(namespaces):
++    verified = {}
++    for name in namespaces:
++        online = ns(name, ["cat", "/sys/devices/system/cpu/online"]).strip()
++        cpus = []
++        for part in online.split(","):
++            first, _, last = part.partition("-")
++            cpus.extend(range(int(first), int(last or first) + 1))
++        mask = format(sum(1 << i for i in cpus), "x")
++        files = ns(name, ["sh", "-c",
++                         "find /sys/class/net/*/queues -name rps_cpus"]).splitlines()
++        assert files, "No RPS queues: " + name
++        for file in files:
++            ns(name, ["sh", "-c", "printf '%s' " + mask + " > " + file])
++            actual = ns(name, ["cat", file]).strip().replace(",", "")
++            assert int(actual, 16) == int(mask, 16), (file, actual, mask)
++        verified[name] = {"online": online, "mask": mask, "queues": len(files)}
++    return verified
++
++def main():
++    if os.geteuid() != 0:
++        print("TAP version 13\n1..0 # SKIP requires root and network namespaces")
++        return 4
++    for tool in ["ip", "nft"]:
++        import shutil
++        if not shutil.which(tool):
++            print("TAP version 13\n1..0 # SKIP missing " + tool)
++            return 4
++    prefix = "mtuf-" + str(os.getpid())
++    root = Path(tempfile.mkdtemp(prefix="nft-flowtable-mtu-"))
++    records = []
++    failures = 0
++    cases = [(layout, version, reverse)
++             for layout in ["native", "vlan", "bridge"]
++             for version in [4, 6] for reverse in [False, True]]
++    print("TAP version 13\n1.." + str(len(cases)), flush=True)
++    for number, (layout, version, reverse) in enumerate(cases, 1):
++        names = [prefix + suffix for suffix in ["a", "r", "b"]]
++        left, router, right = names
++        processes = []
++        label = layout + "-ipv" + str(version) + ("-reverse" if reverse else "-forward")
++        details = {"case": label, "phases": []}
++        try:
++            for name in names:
++                run(["ip", "netns", "add", name])
++                ns(name, ["ip", "link", "set", "lo", "up"])
++                write_sysctl(name, "net/ipv6/conf/all/accept_dad", 0)
++                write_sysctl(name, "net/ipv6/conf/default/accept_dad", 0)
++            for endpoint, inside, outside in [(left, "rl", "ep"), (right, "rr", "ep")]:
++                ns(router, ["ip", "link", "add", inside, "type", "veth",
++                            "peer", "name", outside, "netns", endpoint])
++                for name, dev in [(router, inside), (endpoint, outside)]:
++                    ns(name, ["ip", "link", "set", dev, "mtu",
++                              "1504" if layout == "vlan" else "1500"])
++                    ns(name, ["ip", "link", "set", dev, "up"])
++            rdevs = ["rl", "rr"]
++            edevs = ["ep", "ep"]
++            if layout == "vlan":
++                for index, (endpoint, physical) in enumerate([(left, "rl"), (right, "rr")]):
++                    tag = 100 + index
++                    for name, parent in [(router, physical), (endpoint, "ep")]:
++                        ns(name, ["ip", "link", "add", "link", parent, "name",
++                                  parent + ".v", "type", "vlan", "id", str(tag)])
++                        ns(name, ["ip", "link", "set", parent + ".v", "mtu", "1500"])
++                        ns(name, ["ip", "link", "set", parent + ".v", "up"])
++                    rdevs[index] = physical + ".v"
++                    edevs[index] = "ep.v"
++            elif layout == "bridge":
++                for index, physical in enumerate(["rl", "rr"]):
++                    bridge = "br" + str(index)
++                    ns(router, ["ip", "link", "add", bridge, "type", "bridge",
++                                "stp_state", "0", "forward_delay", "0"])
++                    ns(router, ["ip", "link", "set", physical, "master", bridge])
++                    ns(router, ["ip", "link", "set", bridge, "up"])
++                    rdevs[index] = bridge
++            family = socket.AF_INET if version == 4 else socket.AF_INET6
++            addresses = (["192.168.10.1", "192.168.20.1"] if version == 4
++                         else ["fd42:10::1", "fd42:20::1"])
++            gateways = (["192.168.10.254", "192.168.20.254"] if version == 4
++                        else ["fd42:10::fe", "fd42:20::fe"])
++            length = "24" if version == 4 else "64"
++            for index, endpoint in enumerate([left, right]):
++                ns(endpoint, ["ip", "addr", "add", addresses[index] + "/" + length,
++                              "dev", edevs[index]])
++                ns(router, ["ip", "addr", "add", gateways[index] + "/" + length,
++                            "dev", rdevs[index]])
++                ns(endpoint, ["ip", "-" + str(version), "route", "add", "default",
++                              "via", gateways[index], "dev", edevs[index]])
++            write_sysctl(router, "net/ipv4/ip_forward", 1)
++            write_sysctl(router, "net/ipv6/conf/all/forwarding", 1)
++            rules = """table inet mtu_test {
++ flowtable ft { hook ingress priority 0; devices = { rl, rr }; }
++ chain forward { type filter hook forward priority 0; policy accept;
++  ct state established meta l4proto udp flow add @ft counter
++ }
++}
++"""
++            ns(router, ["nft", "-f", "-"], input=rules)
++            details["rps"] = set_rps(names)
++            server_ns, client_ns = (left, right) if reverse else (right, left)
++            client_index = 1 if reverse else 0
++            client_ip = addresses[client_index]
++            server_ip = addresses[1 - client_index]
++            output = rdevs[0] if reverse else rdevs[1]
++            logfile = root / (str(number) + ".jsonl")
++            server = subprocess.Popen(
++                ["ip", "netns", "exec", server_ns, sys.executable, __file__,
++                 "--server", str(family), server_ip, "42001", str(logfile)],
++                stdout=subprocess.DEVNULL)
++            processes.append(server)
++            for _ in range(50):
++                if logfile.exists() and logfile.stat().st_size:
++                    break
++                time.sleep(0.02)
++            else:
++                raise RuntimeError("Receiver did not become ready")
++            sender = subprocess.Popen(
++                ["ip", "netns", "exec", client_ns, sys.executable, __file__,
++                 "--client", str(family), client_ip, server_ip],
++                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
++            processes.append(sender)
++            def probe(payload, count):
++                sender.stdin.write(json.dumps({"length": payload, "count": count}) + "\n")
++                sender.stdin.flush()
++                ready = select.select([sender.stdout], [], [], 15)[0]
++                assert ready, "Timed out waiting for the sender"
++                response = json.loads(sender.stdout.readline())
++                assert not response["errors"], response
++                time.sleep(0.03)
++                delivered = {r["seq"] for r in map(json.loads, logfile.read_text().splitlines())
++                             if "seq" in r}
++                response["delivered"] = len(set(response["sent"]) & delivered)
++                return response
++            large = 1500 - (28 if version == 4 else 48)
++            for mtu in [1492, 1400, 1280]:
++                ns(router, ["ip", "link", "set", output, "mtu", "1500"])
++                warm = probe(100, 10)
++                assert warm["delivered"] == 10 and warm["replies"] >= 8, ("warm", warm)
++                state = ns(router, ["cat", "/proc/net/nf_conntrack"])
++                assert "OFFLOAD" in state, ("Flow not offloaded", state)
++                ns(router, ["ip", "link", "set", output, "mtu", str(mtu)])
++                oversized = probe(large, 2)
++                boundary = probe(mtu - (28 if version == 4 else 48), 2)
++                phase = {"mtu": mtu, "warm_flow_offloaded": True,
++                         "oversized": oversized, "boundary": boundary}
++                details["phases"].append(phase)
++                assert boundary["delivered"] == 2, ("In-range delivery", phase)
++            ns(router, ["ip", "link", "set", output, "mtu", "1500"])
++            restored = probe(large, 2)
++            details["restored"] = restored
++            assert restored["delivered"] == 2, ("Restored MTU", restored)
++            escaped = sum(p["oversized"]["delivered"] for p in details["phases"])
++            assert escaped == 0, ("Oversized DF packets delivered", escaped)
++            print("ok " + str(number) + " - " + label, flush=True)
++        except Exception as error:
++            failures += 1
++            details["error"] = repr(error)
++            print("not ok " + str(number) + " - " + label, flush=True)
++        finally:
++            for process in processes:
++                process.terminate()
++            for process in processes:
++                try:
++                    process.wait(timeout=2)
++                except subprocess.TimeoutExpired:
++                    process.kill()
++            for name in reversed(names):
++                subprocess.run(["ip", "netns", "delete", name],
++                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            records.append(details)
++            print("# " + json.dumps(details), flush=True)
++    print("# MTU_SUMMARY " + json.dumps({"cases": len(cases), "failed": failures,
++                                        "records": records}), flush=True)
++    shutil.rmtree(root)
++    return bool(failures)
++
++if __name__ == "__main__":
++    if len(sys.argv) > 1 and sys.argv[1] == "--server":
++        echo_server(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), sys.argv[5])
++    elif len(sys.argv) > 1 and sys.argv[1] == "--client":
++        client(int(sys.argv[2]), sys.argv[3], sys.argv[4])
++    else:
++        sys.exit(main())
++
